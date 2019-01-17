@@ -3,24 +3,37 @@ package version
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
-
-	pb "github.com/linkerd/linkerd2/controller/gen/public"
 )
+
+type channelVersion struct {
+	channel string
+	version string
+}
+
+var undefinedChannel = "dev"
+var undefinedVersion = "undefined"
+var undefinedChannelVersion = channelVersion{"dev", "undefined"}.String()
 
 // Version is updated automatically as part of the build process
 //
 // DO NOT EDIT
-var Version = undefinedVersion
+var Version = undefinedChannelVersion
+
+// Channels provides an interface to interact with a set of release channels
+type Channels struct {
+	array []channelVersion
+}
 
 const (
-	undefinedVersion = "undefined"
-	versionCheckURL  = "https://versioncheck.linkerd.io/version.json?version=%s&uuid=%s&source=%s"
+	versionCheckURL = "https://versioncheck.linkerd.io/version.json?version=%s&uuid=%s&source=%s"
 )
 
 func init() {
@@ -29,7 +42,7 @@ func init() {
 	// unintentionally. This mechanism allows the version to be bound at
 	// container build time instead of at executable link time to improve
 	// incremental rebuild efficiency.
-	if Version == undefinedVersion {
+	if Version == undefinedChannelVersion {
 		override := os.Getenv("LINKERD_CONTAINER_VERSION_OVERRIDE")
 		if override != "" {
 			Version = override
@@ -37,114 +50,153 @@ func init() {
 	}
 }
 
+// TODO: delete
 // CheckClientVersion validates whether the Linkerd Public API client's version
 // matches an expected version.
 func CheckClientVersion(expectedVersion string) error {
-	if Version != expectedVersion {
-		return versionMismatchError(expectedVersion, Version)
-	}
-
-	return nil
+	return Match(expectedVersion, Version)
 }
 
-// GetServerVersion returns the Linkerd Public API server version
-func GetServerVersion(apiClient pb.ApiClient) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	rsp, err := apiClient.Version(ctx, &pb.Empty{})
-	if err != nil {
-		return "", err
-	}
-
-	return rsp.GetReleaseVersion(), nil
-}
-
-// CheckServerVersion validates whether the Linkerd Public API server's version
-// matches an expected version.
-func CheckServerVersion(apiClient pb.ApiClient, expectedVersion string) error {
-	releaseVersion, err := GetServerVersion(apiClient)
-	if err != nil {
-		return err
-	}
-
-	if releaseVersion != expectedVersion {
-		return versionMismatchError(expectedVersion, releaseVersion)
-	}
-
-	return nil
-}
-
-// GetLatestVersion performs an online request to check for the latest Linkerd
-// version.
-func GetLatestVersion(uuid string, source string) (string, error) {
+// GetLatestVersions performs an online request to check for the latest Linkerd
+// release channels.
+func GetLatestVersions(uuid string, source string) (Channels, error) {
 	url := fmt.Sprintf(versionCheckURL, Version, uuid, source)
+	return getLatestVersions(http.DefaultClient, url, uuid, source)
+}
+
+func getLatestVersions(client *http.Client, url string, uuid string, source string) (Channels, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return "", err
+		return Channels{}, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	rsp, err := http.DefaultClient.Do(req.WithContext(ctx))
+	rsp, err := client.Do(req.WithContext(ctx))
 	if err != nil {
-		return "", err
+		return Channels{}, err
 	}
 	defer rsp.Body.Close()
 
 	if rsp.StatusCode != 200 {
-		return "", fmt.Errorf("Unexpected versioncheck response: %s", rsp.Status)
+		return Channels{}, fmt.Errorf("Unexpected versioncheck response: %s", rsp.Status)
 	}
 
 	bytes, err := ioutil.ReadAll(rsp.Body)
 	if err != nil {
-		return "", err
+		return Channels{}, err
 	}
 
 	var versionRsp map[string]string
 	err = json.Unmarshal(bytes, &versionRsp)
 	if err != nil {
-		return "", err
+		return Channels{}, err
 	}
 
-	channel := parseChannel(Version)
-	if channel == "" {
-		return "", fmt.Errorf("Unsupported version format: %s", Version)
+	channels := Channels{}
+	for c, v := range versionRsp {
+		channels.array = append(channels.array, channelVersion{c, v})
 	}
 
-	version, ok := versionRsp[channel]
-	if !ok {
-		return "", fmt.Errorf("Unsupported version channel: %s", channel)
-	}
+	sort.Sort(byCV(channels.array))
 
-	return version, nil
+	return channels, nil
 }
 
-func parseVersion(version string) string {
-	if parts := strings.SplitN(version, "-", 2); len(parts) == 2 {
-		return parts[1]
+// Match compares two versions and returns success if they match, or an error
+// with a contextual message if they do not.
+func Match(expectedVersion, actualVersion string) error {
+	if expectedVersion == "" {
+		return errors.New("expected version is empty")
+	} else if actualVersion == "" {
+		return errors.New("actual version is empty")
+	} else if actualVersion == expectedVersion {
+		return nil
 	}
-	return version
+
+	actual, err := parseChannelVersion(actualVersion)
+	if err != nil {
+		return fmt.Errorf("failed to parse actual version: %s", err)
+	}
+	expected, err := parseChannelVersion(expectedVersion)
+	if err != nil {
+		return fmt.Errorf("failed to parse expected version: %s", err)
+	}
+
+	if actual.channel != expected.channel {
+		return fmt.Errorf("mismatched channels: running %s but retrieved %s",
+			actual, expected)
+	}
+
+	return fmt.Errorf("is running version %s but the latest %s version is %s",
+		actual.version, actual.channel, expected.version)
 }
 
-func parseChannel(version string) string {
-	if parts := strings.SplitN(version, "-", 2); len(parts) == 2 {
-		return parts[0]
-	}
-	return ""
+func (cv channelVersion) String() string {
+	return fmt.Sprintf("%s-%s", cv.channel, cv.version)
 }
 
-func versionMismatchError(expectedVersion, actualVersion string) error {
-	channel := parseChannel(expectedVersion)
-	expectedVersionStr := parseVersion(expectedVersion)
-	actualVersionStr := parseVersion(actualVersion)
+func parseChannelVersion(cv string) (channelVersion, error) {
+	if parts := strings.SplitN(cv, "-", 2); len(parts) == 2 {
+		return channelVersion{
+			channel: parts[0],
+			version: parts[1],
+		}, nil
+	}
+	return channelVersion{}, fmt.Errorf("unsupported version format: %s", cv)
+}
 
-	if channel != "" {
-		return fmt.Errorf("is running version %s but the latest %s version is %s",
-			actualVersionStr, channel, expectedVersionStr)
+func NewChannels(channels []string) (Channels, error) {
+	c := Channels{}
+	for _, channel := range channels {
+		cv, err := parseChannelVersion(channel)
+		if err != nil {
+			return Channels{}, err
+		}
+
+		c.array = append(c.array, cv)
 	}
 
-	return fmt.Errorf("is running version %s but the latest version is %s",
-		actualVersionStr, expectedVersionStr)
+	return c, nil
+}
+
+func (c Channels) Match(actualVersion string) error {
+	if actualVersion == "" {
+		return errors.New("actual version is empty")
+	}
+
+	actual, err := parseChannelVersion(actualVersion)
+	if err != nil {
+		return fmt.Errorf("failed to parse actual version: %s", err)
+	}
+
+	for _, cv := range c.array {
+		if cv.channel == actual.channel {
+			return Match(cv.String(), actual.String())
+		}
+	}
+
+	return fmt.Errorf("unsupported version channel: %s", actualVersion)
+}
+
+type byCV []channelVersion
+
+func (b byCV) Len() int {
+	return len(b)
+}
+
+func (b byCV) Swap(i, j int) {
+	b[i], b[j] = b[j], b[i]
+}
+
+func (b byCV) Less(i, j int) bool {
+	if b[i].channel == "" {
+		return true
+	}
+	if b[j].channel == "" {
+		return false
+	}
+
+	return b[i].channel < b[j].channel
 }
