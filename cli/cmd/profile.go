@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,11 +10,15 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"time"
 
 	"github.com/ghodss/yaml"
 	"github.com/go-openapi/spec"
+	"github.com/linkerd/linkerd2/controller/api/util"
 	sp "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha1"
+	pb "github.com/linkerd/linkerd2/controller/gen/public"
 	"github.com/linkerd/linkerd2/pkg/profiles"
+	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -29,18 +34,22 @@ type templateConfig struct {
 var pathParamRegex = regexp.MustCompile(`\\{[^\}]*\\}`)
 
 type profileOptions struct {
-	name      string
-	namespace string
-	template  bool
-	openAPI   string
+	name        string
+	namespace   string
+	template    bool
+	openAPI     string
+	tap         string
+	tapDuration string
 }
 
 func newProfileOptions() *profileOptions {
 	return &profileOptions{
-		name:      "",
-		namespace: "default",
-		template:  false,
-		openAPI:   "",
+		name:        "",
+		namespace:   "default",
+		template:    false,
+		openAPI:     "",
+		tap:         "",
+		tapDuration: "5s",
 	}
 }
 
@@ -52,8 +61,11 @@ func (options *profileOptions) validate() error {
 	if options.openAPI != "" {
 		outputs++
 	}
+	if options.tap != "" {
+		outputs++
+	}
 	if outputs != 1 {
-		return errors.New("You must specify exactly one of --template or --open-api")
+		return errors.New("You must specify exactly one of --template or --open-api or --tap")
 	}
 
 	// a DNS-1035 label must consist of lower case alphanumeric characters or '-',
@@ -68,6 +80,10 @@ func (options *profileOptions) validate() error {
 		return fmt.Errorf("invalid namespace %q: %v", options.namespace, errs)
 	}
 
+	if _, err := time.ParseDuration(options.tapDuration); err != nil {
+		return fmt.Errorf("invalid duration %q: %v", options.tapDuration, err)
+	}
+
 	return nil
 }
 
@@ -76,7 +92,7 @@ func newCmdProfile() *cobra.Command {
 	options := newProfileOptions()
 
 	cmd := &cobra.Command{
-		Use:   "profile [flags] (--template | --open-api file) (SERVICE)",
+		Use:   "profile [flags] (--template | --open-api file | --tap resource) (SERVICE)",
 		Short: "Output service profile config for Kubernetes",
 		Long: `Output service profile config for Kubernetes.
 
@@ -86,6 +102,9 @@ If the --template flag is specified, it outputs a service profile template.
 Edit the template and then apply it with kubectl to add a service profile to
 a service.
 
+If the --tap flag is specified, it runs linkerd tap TARGET for --tap-duration seconds, and
+creates a profile for the SERVICE based on the requests seen in that window
+
 Example:
   linkerd profile -n emojivoto --template web-svc > web-svc-profile.yaml
   # (edit web-svc-profile.yaml manually)
@@ -93,6 +112,14 @@ Example:
 
 If the --open-api flag is specified, it reads the given OpenAPI
 specification file and outputs a corresponding service profile.
+
+Example:
+	linkerd profile --tap deploy/books --tap-duration 10s books | book-svc-profile.yaml
+	# (edit book-svc-profile.yaml manualy)
+	kubectl apply -f book-svc-profile.yaml
+
+The command will run linkerd tap deploy/books for tap-duration seconds, and then create
+a service profile for the books service with routes prepopulated from the tap data.
 
 Example:
   linkerd profile -n emojivoto --open-api web-svc.swagger web-svc | kubectl apply -f -`,
@@ -109,6 +136,8 @@ Example:
 				return profiles.RenderProfileTemplate(options.namespace, options.name, controlPlaneNamespace, os.Stdout)
 			} else if options.openAPI != "" {
 				return renderOpenAPI(options, os.Stdout)
+			} else if options.tap != "" {
+				return renderTapOutputProfile(options, controlPlaneNamespace, os.Stdout)
 			}
 
 			// we should never get here
@@ -118,9 +147,127 @@ Example:
 
 	cmd.PersistentFlags().BoolVar(&options.template, "template", options.template, "Output a service profile template")
 	cmd.PersistentFlags().StringVar(&options.openAPI, "open-api", options.openAPI, "Output a service profile based on the given OpenAPI spec file")
+	cmd.PersistentFlags().StringVar(&options.tap, "tap", options.tap, "Output a service profile based on tap data for the given target resource")
+	cmd.PersistentFlags().StringVarP(&options.tapDuration, "tap-duration", "t", options.tapDuration, "Duration over which tap data is collected (for example: \"10s\", \"1m\", \"10m\")")
 	cmd.PersistentFlags().StringVarP(&options.namespace, "namespace", "n", options.namespace, "Namespace of the service")
 
 	return cmd
+}
+
+func renderTapOutputProfile(options *profileOptions, controlPlaneNamespace string, w io.Writer) error {
+	profile := sp.ServiceProfile{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:      fmt.Sprintf("%s.%s.svc.cluster.local", options.name, options.namespace),
+			Namespace: controlPlaneNamespace,
+		},
+		TypeMeta: meta_v1.TypeMeta{
+			APIVersion: "linkerd.io/v1alpha1",
+			Kind:       "ServiceProfile",
+		},
+	}
+
+	log.Debug("Running `linkerd tap %s --namespace %s`", options.tap, options.namespace)
+	client := cliPublicAPIClient()
+	requestParams := util.TapRequestParams{
+		Resource:  options.tap,
+		Namespace: options.namespace,
+	}
+	req, err := util.BuildTapByResourceRequest(requestParams)
+	rsp, err := client.TapByResource(context.Background(), req)
+	if err != nil {
+		return err
+	}
+	tapDuration, _ := time.ParseDuration(options.tapDuration)
+	routes := routeSpecFromTap(w, rsp, tapDuration)
+
+	profile.Spec.Routes = routes
+	output, err := yaml.Marshal(profile)
+	if err != nil {
+		return fmt.Errorf("Error writing Service Profile: %s", err)
+	}
+	w.Write(output)
+	return nil
+}
+
+func routeSpecFromTap(w io.Writer, tapClient pb.Api_TapByResourceClient, tapDuration time.Duration) []*sp.RouteSpec {
+	routes := make([]*sp.RouteSpec, 0)
+	routeCounts := countRoutesFromTap(tapClient, tapDuration)
+
+	for _, route := range sortMapKeys(routeCounts) {
+		routes = append(routes, route)
+	}
+	return routes
+}
+
+func countRoutesFromTap(tapClient pb.Api_TapByResourceClient, tapDuration time.Duration) map[*sp.RouteSpec]int {
+	routeCounts := make(map[*sp.RouteSpec]int)
+	timerChannel := make(chan string, 1)
+	go func() {
+		time.Sleep(tapDuration)
+		timerChannel <- "done"
+	}()
+	done := ""
+
+	for {
+		log.Debug("Waiting for data...")
+		event, err := tapClient.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			break
+		}
+		routeSpec := getPathDataFromTap(event)
+
+		if routeSpec != nil {
+			routeCounts[routeSpec]++
+		}
+
+		select {
+		case done = <-timerChannel:
+		default:
+			// do nothing
+		}
+		if done != "" {
+			break
+		}
+	}
+
+	return routeCounts
+}
+
+func sortMapKeys(m map[*sp.RouteSpec]int) []*sp.RouteSpec {
+	keys := make([]*sp.RouteSpec, 0)
+	for key, _ := range m {
+		keys = append(keys, key)
+	}
+	sort.Sort(byRouteSpec(keys))
+	return keys
+}
+
+type byRouteSpec []*sp.RouteSpec
+
+func (rs byRouteSpec) Len() int {
+	return len(rs)
+}
+func (rs byRouteSpec) Swap(i, j int) {
+	rs[i], rs[j] = rs[j], rs[i]
+}
+func (rs byRouteSpec) Less(i, j int) bool {
+	return rs[i].Name < rs[j].Name
+}
+
+func getPathDataFromTap(event *pb.TapEvent) *sp.RouteSpec {
+	switch ev := event.GetHttp().GetEvent().(type) {
+	case *pb.TapEvent_Http_RequestInit_:
+		return mkRouteSpec(
+			ev.RequestInit.GetPath(),
+			ev.RequestInit.GetPath(), // for now, no path consolidation
+			ev.RequestInit.GetMethod().GetRegistered().String(), nil)
+	default:
+		return nil
+	}
 }
 
 func renderOpenAPI(options *profileOptions, w io.Writer) error {
